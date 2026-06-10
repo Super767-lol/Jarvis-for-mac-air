@@ -1,0 +1,57 @@
+{
+  "name": "jarvis-desktop",
+  "productName": "Jarvis",
+  "version": "1.0.0",
+  "description": "Your personal AI assistant — Claude-powered, lives in the macOS menu bar.",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "concurrently -k \"yarn dev:renderer\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev:renderer": "vite",
+    "build:renderer": "vite build",
+    "build": "yarn build:renderer && electron-builder --mac --arm64 --x64",
+    "build:dmg": "yarn build:renderer && electron-builder --mac dmg"
+  },
+  "build": {
+    "appId": "com.jarvis.desktop",
+    "productName": "Jarvis",
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": ["dmg"],
+      "icon": "build/icon.icns",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "LSUIElement": 1,
+        "NSMicrophoneUsageDescription": "Jarvis needs microphone access for voice input.",
+        "NSAppleEventsUsageDescription": "Jarvis controls apps via AppleScript on your request."
+      }
+    }
+  },
+  "author": "You",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.1",
+    "@phosphor-icons/react": "^2.1.10",
+    "dotenv": "^16.4.5",
+    "framer-motion": "^11.18.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "vite": "^6.0.7",
+    "wait-on": "^8.0.1"
+  }
+}

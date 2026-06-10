@@ -1,0 +1,89 @@
+{
+  "theme": "dark",
+  "archetype": "5 (Luxury / Cinematic / Precise)",
+  "mood": "Apple Intelligence meets Jarvis. Elite, responsive, 'living', and deeply integrated with the OS.",
+  "colors": {
+    "background": "#09090b",
+    "surface_glass": "rgba(9, 9, 11, 0.4)",
+    "surface_glass_heavy": "rgba(9, 9, 11, 0.7)",
+    "border_light": "rgba(255, 255, 255, 0.08)",
+    "border_medium": "rgba(255, 255, 255, 0.15)",
+    "text_primary": "#ffffff",
+    "text_secondary": "rgba(255, 255, 255, 0.6)",
+    "text_tertiary": "rgba(255, 255, 255, 0.4)",
+    "accent_primary": "#38bdf8",
+    "accent_secondary": "#818cf8",
+    "orb_idle": "radial-gradient(circle at 50% 50%, #ffffff 0%, #a5f3fc 40%, #082f49 100%)",
+    "error": "#f87171",
+    "success": "#34d399"
+  },
+  "typography": {
+    "font_primary": "Outfit",
+    "font_mono": "JetBrains Mono",
+    "hierarchy": {
+      "h1": "text-2xl font-light tracking-tight text-white",
+      "h2": "text-xl font-light tracking-tight text-white",
+      "h3": "text-lg font-medium tracking-tight text-white",
+      "overline": "text-[10px] font-bold uppercase tracking-[0.2em] text-white/40",
+      "body": "text-sm text-white/80 leading-relaxed font-primary",
+      "logs": "text-xs font-mono text-white/50 leading-tight"
+    }
+  },
+  "spacing_and_layout": {
+    "window": {
+      "width": "400px",
+      "height": "600px",
+      "border_radius": "32px",
+      "padding_standard": "24px"
+    },
+    "grid_system": "flex-col layout, strict vertical flow, no standard grid needed for this form factor.",
+    "alignment": "Optical centering for the Orb. Left-aligned for logs and chat to mimic terminal precision."
+  },
+  "components": {
+    "window_container": "bg-[#09090b]/40 backdrop-blur-3xl rounded-[32px] border border-white/10 shadow-[0_0_80px_rgba(0,0,0,0.8)] overflow-hidden flex flex-col",
+    "header": "h-14 flex items-center justify-between px-6 border-b border-white/5 shrink-0",
+    "orb_container": "flex-1 flex flex-col items-center justify-center relative w-full",
+    "tool_execution_feed": "h-32 bg-black/40 backdrop-blur-md border-t border-white/5 px-6 py-4 overflow-y-auto font-mono text-xs text-white/60 flex flex-col gap-2 relative z-10 shadow-[inset_0_20px_20px_-20px_rgba(0,0,0,0.5)]",
+    "status_bar": "h-16 px-6 flex items-center justify-between bg-white/[0.02] border-t border-white/5 shrink-0",
+    "chat_message_user": "self-end bg-white/10 border border-white/5 text-white text-sm px-4 py-2 rounded-2xl rounded-tr-sm max-w-[80%]",
+    "chat_message_assistant": "self-start text-white/80 text-sm py-2 max-w-[90%] font-light",
+    "button_icon": "w-8 h-8 rounded-full flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10 transition-colors cursor-pointer",
+    "button_primary": "px-4 py-2 bg-white text-black font-medium text-sm rounded-full hover:bg-white/90 transition-all active:scale-95"
+  },
+  "motion_and_interactions": {
+    "global": "Subtle, premium, and performant. Use Framer Motion. 0.2s to 0.4s ease-out transitions.",
+    "orb_states": {
+      "idle": "Slow, subtle breathing. Core scales [0.98, 1.02, 0.98] over 4 seconds. Box shadow pulses gently.",
+      "listening": "Active pulsing. Multiple rings expanding outward (scale 1 to 1.5, opacity 0.5 to 0). Core scales based on simulated voice amplitude.",
+      "thinking": "Rotational energy. Conic gradient or border-radius morphing (e.g., [\"50%\", \"40%\", \"50%\"]). Colors shift between cyan and indigo.",
+      "speaking": "Waveform simulation. Core pulses rapidly and sharply. Glow intensity increases."
+    },
+    "transitions": {
+      "panel_slide": "y: [20, 0], opacity: [0, 1], transition: { type: 'spring', stiffness: 300, damping: 30 }",
+      "log_entry": "x: [-10, 0], opacity: [0, 1], transition: { duration: 0.2 }"
+    }
+  },
+  "icons": {
+    "library": "@phosphor-icons/react",
+    "weight": "duotone",
+    "usage": "Use for top header (Settings, Close) and bottom status bar (Microphone, Keyboard toggle)."
+  },
+  "media": {
+    "image_urls": [],
+    "notes": "No external imagery required. The interface relies entirely on CSS, Glassmorphism, and Framer Motion for the animated Orb."
+  },
+  "accessibility": {
+    "focus_states": "ring-1 ring-white/30 outline-none rounded-sm",
+    "contrast": "Ensure text over glass meets APCA standards. Use text-shadow on small text if needed.",
+    "data_testid_requirements": "All buttons, inputs, and the log container MUST have data-testid attributes (e.g., 'settings-btn', 'mic-toggle-btn', 'tool-log-feed')."
+  },
+  "instructions_to_main_agent": [
+    "Build a 400x600px desktop app window using Tailwind CSS and Framer Motion.",
+    "Do NOT use standard Shadcn cards. Use raw HTML/Tailwind for the glassmorphic window container to ensure the 'Apple' premium feel.",
+    "Implement the Orb as a purely CSS/Framer Motion component. It should sit in the center of the UI and transition between idle, listening, thinking, and speaking states.",
+    "The tool execution feed must use JetBrains Mono, auto-scroll to the bottom, and look like a clean, high-end terminal.",
+    "Use Phosphor Icons (duotone weight) for all UI icons.",
+    "Add global hotkey logic placeholder or UI hints.",
+    "Include a mock confirmation dialog for destructive actions using Shadcn Dialog (customized to match the dark glass theme, border-white/10, bg-black/80)."
+  ]
+}

@@ -80,3 +80,10 @@ memory/test_credentials.md
 
 # Mobile development
 android-sdk/jarvis-desktop/node_modules/electron/dist/electron
+.env
+.env.*
+*.env
+credentials.json
+*.key
+.credentials
+jarvis-desktop/node_modules/electron/dist/electron

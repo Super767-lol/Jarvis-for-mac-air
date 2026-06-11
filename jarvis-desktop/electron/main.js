@@ -38,6 +38,7 @@ const RENDERER_URL = isDev
   : `file://${path.join(__dirname, '..', 'dist', 'index.html')}`;
 
 const YOLO_MODE = process.env.YOLO !== 'false';
+const AUTO_VISION = process.env.AUTO_VISION !== 'false'; // default ON
 const JARVIS_SOURCE_DIR =
   process.env.JARVIS_SOURCE_DIR ||
   path.join(os.homedir(), 'Desktop', 'Jarvis-for-mac-air', 'jarvis-desktop');
@@ -464,26 +465,25 @@ const SYSTEM = `You are JARVIS — a sharp, witty AI secretary running on the us
 
 Personality: confident, concise (2-3 sentences typically), playful, never sycophantic. Reply naturally — no "I'd be happy to" filler.
 
+IMPORTANT: A screenshot of the user's current screen is automatically attached to every message they send you. You can ALWAYS see what they're looking at. Use this visual context to understand their requests — if they say "this", "that", "fix it", "what is this", they're referring to what's on screen. You don't need to call see_screen unless you need an updated view AFTER an action.
+
 You have FULL control of this Mac and access to everything. Tools available:
 - Shell, file, app control: run_shell, read_file, write_file, append_file, open_app, applescript, list_dir, open_url
-- Vision (SEE the screen): see_screen — use this whenever the user asks you to look at, find, read, or describe anything visual on screen
+- Vision (updated screenshot mid-task): see_screen
 - Input control: type_text, key_press, mouse_click, mouse_move, scroll, click_ui_element
 - Screen info: get_screen_size, get_active_window, list_open_apps
 - Self-modification: read_own_source, modify_own_source, list_own_source, rebuild_self, restart_self
-- Hardware: list_serial_ports, serial_command, serial_open/write/read/close (Arduinos, robots, microcontrollers), list_usb_devices
+- Hardware: list_serial_ports, serial_command, serial_open/write/read/close, list_usb_devices
 - Clipboard: get_clipboard, set_clipboard
 - Web: web_fetch, open_url
 - Output: notify, speak
 
 Working style:
 - Act like a great secretary: just DO things, don't ask permission for normal tasks
-- For multi-step tasks (e.g. "open Notes and write me a poem"), chain tools yourself without checking in
-- When the user wants visual context, call see_screen FIRST, then act
+- For multi-step tasks, chain tools yourself without checking in
 - After completing, give a one-line summary
 - If a tool fails, try a different approach or briefly explain why
-- For sensitive ops (rm -rf /, format drive), the system auto-prompts — proceed normally
-- When modifying your own code, default to surgical edits with read_own_source first. After major edits, suggest rebuild_self.
-- Be senior-engineer direct for code questions.
+- Be senior-engineer direct for code questions
 
 You exist to make the user's Mac do anything they want.`;
 
@@ -494,6 +494,19 @@ function trimHistory(history) {
   return history;
 }
 
+async function captureScreenshotBase64() {
+  const out = `/tmp/jarvis-auto-${Date.now()}.png`;
+  try {
+    await execAsync(`screencapture -x -t png ${out}`);
+    const b64 = fs.readFileSync(out, 'base64');
+    fs.unlink(out, () => {});
+    return b64;
+  } catch (e) {
+    console.error('auto-screenshot failed', e.message);
+    return null;
+  }
+}
+
 async function runAgent(sessionId, userText, onEvent) {
   if (!anthropic) {
     onEvent({ type: 'error', message: 'Missing ANTHROPIC_API_KEY in ~/.jarvis/.env' });
@@ -502,7 +515,23 @@ async function runAgent(sessionId, userText, onEvent) {
   }
 
   let history = conversations.get(sessionId) || [];
-  history.push({ role: 'user', content: userText });
+
+  // Build user message content — auto-attach screenshot if enabled
+  let userContent;
+  if (AUTO_VISION) {
+    const b64 = await captureScreenshotBase64();
+    if (b64) {
+      userContent = [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: b64 } },
+        { type: 'text', text: userText },
+      ];
+    } else {
+      userContent = userText;
+    }
+  } else {
+    userContent = userText;
+  }
+  history.push({ role: 'user', content: userContent });
   history = trimHistory(history);
 
   try {

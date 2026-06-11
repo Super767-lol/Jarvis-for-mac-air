@@ -6,7 +6,19 @@ const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
 const { promisify } = require('util');
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
+// Load .env from multiple locations (dev + production .app)
+const envCandidates = [
+  path.join(__dirname, '..', '.env'),                          // dev mode
+  path.join(process.resourcesPath || '', '.env'),              // bundled in .app
+  path.join(require('os').homedir(), '.jarvis', '.env'),       // user config (persistent across builds)
+];
+for (const p of envCandidates) {
+  if (p && fs.existsSync(p)) {
+    require('dotenv').config({ path: p });
+    break;
+  }
+}
 
 const Anthropic = require('@anthropic-ai/sdk');
 const { SerialPort } = require('serialport');

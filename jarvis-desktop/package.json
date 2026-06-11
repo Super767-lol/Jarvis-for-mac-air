@@ -14,22 +14,13 @@
   "build": {
     "appId": "com.jarvis.desktop",
     "productName": "Jarvis",
-    "asarUnpack": [
-      "**/node_modules/serialport/**/*",
-      "**/node_modules/@serialport/**/*",
-      "**/node_modules/bindings/**/*",
-      "**/node_modules/node-addon-api/**/*",
-      "**/node_modules/**/build/Release/*.node",
-      "**/node_modules/**/prebuilds/**/*"
-    ],
+    "asar": false,
+    "npmRebuild": true,
     "files": [
       "electron/**/*",
       "dist/**/*",
       "node_modules/**/*",
       "package.json",
-      "!**/node_modules/*/{CHANGELOG.md,README.md,readme.md,.npmignore,.travis.yml,.eslintrc*}",
-      "!**/node_modules/*.d.ts",
-      "!**/node_modules/.bin",
       "!**/{.DS_Store,.git,.svn,.hg,CVS,RCS,SCCS,__pycache__,thumbs.db,.gitignore,.gitattributes,.editorconfig,.flowconfig,.yarn-metadata.json,.idea,appveyor.yml,.travis.yml,circle.yml,npm-debug.log,.nyc_output,yarn.lock,.yarn-integrity}"
     ],
     "mac": {

@@ -10,12 +10,14 @@ export default function App() {
   const [input, setInput] = useState('');
   const [state, setState] = useState('idle');
   const [showTranscript, setShowTranscript] = useState(false);
+  const [showPhone, setShowPhone] = useState(false);
+  const [phoneInfo, setPhoneInfo] = useState(null);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [hasKey, setHasKey] = useState(true);
   const [toolLog, setToolLog] = useState([
     { t: 'boot', m: 'jarvis.core initialized' },
-    { t: 'info', m: 'claude-sonnet-4-5 online' },
-    { t: 'info', m: 'hotkey: ⌘⇧Space' },
+    { t: 'info', m: 'claude-sonnet-4-5 online · secretary mode' },
+    { t: 'info', m: 'hotkey: ⌘⇧Space · phone: tap 📱' },
   ]);
 
   const transcriptRef = useRef(null);
@@ -39,6 +41,7 @@ export default function App() {
 
   useEffect(() => {
     window.jarvis.hasKey().then(setHasKey);
+    window.jarvis.phoneInfo().then(setPhoneInfo).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -137,6 +140,8 @@ export default function App() {
             <span className="text-[10px] uppercase tracking-[0.3em] font-mono text-white/50">JARVIS</span>
           </div>
           <div className="flex items-center gap-1" data-no-drag>
+            <button onClick={() => setShowPhone((v) => !v)} title="Phone access"
+              className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">📱</button>
             <button onClick={resetConversation} title="Reset conversation"
               className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">↻</button>
             <button onClick={() => setShowTranscript((v) => !v)}
@@ -163,6 +168,41 @@ export default function App() {
               : <span className="text-white/40">{STATUS[state]}</span>}
           </div>
         </div>
+
+        {/* Transcript overlay */}
+        <AnimatePresence>
+          {showPhone && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+              className="absolute inset-x-0 top-12 bottom-28 bg-black/80 backdrop-blur-xl border-t border-white/5 px-5 py-4 overflow-y-auto z-30 flex flex-col items-center gap-4"
+              data-no-drag
+            >
+              <div className="text-[11px] uppercase tracking-[0.3em] font-mono text-white/50">phone access</div>
+              {phoneInfo ? (
+                <>
+                  <div className="bg-white p-2 rounded-2xl">
+                    <img src={phoneInfo.qr} alt="QR" style={{ width: 180, height: 180 }} />
+                  </div>
+                  <div className="text-xs text-white/70 text-center px-4 font-light leading-relaxed">
+                    Scan with your iPhone camera, or visit:
+                  </div>
+                  <div
+                    className="font-mono text-[10px] text-cyan-300/90 bg-black/40 px-3 py-2 rounded-lg break-all max-w-full cursor-pointer hover:bg-black/60"
+                    onClick={() => { navigator.clipboard.writeText(phoneInfo.url); pushLog('info', 'phone URL copied'); }}
+                    title="Click to copy"
+                  >
+                    {phoneInfo.url}
+                  </div>
+                  <div className="text-[10px] text-white/40 text-center px-4 leading-relaxed">
+                    Works on same Wi-Fi. For internet access from anywhere,<br />run <code className="text-amber-300/80">cloudflared tunnel --url http://localhost:47823</code> in terminal.
+                  </div>
+                </>
+              ) : (
+                <div className="text-xs text-white/50">phone server unavailable</div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Transcript overlay */}
         <AnimatePresence>

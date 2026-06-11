@@ -1,17 +1,24 @@
 /**
- * Jarvis Electron main process — v2 (YOLO + full control + reliability).
+ * Jarvis Electron main — v3 (Secretary Mode)
+ * - Full Mac control: shell, files, apps, AppleScript, mouse/keyboard, screen vision
+ * - Vision: take_screenshot auto-feeds image to Claude
+ * - Self-modification: read/write own source files
+ * - Phone access: local web server with token auth + QR code
+ * - Serial: Arduino/robot/USB-serial control
  */
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, screen, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, screen, nativeImage, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { exec } = require('child_process');
+const os = require('os');
+const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
+const crypto = require('crypto');
 
 // Load .env from multiple locations (dev + production .app)
 const envCandidates = [
-  path.join(__dirname, '..', '.env'),                          // dev mode
-  path.join(process.resourcesPath || '', '.env'),              // bundled in .app
-  path.join(require('os').homedir(), '.jarvis', '.env'),       // user config (persistent across builds)
+  path.join(__dirname, '..', '.env'),
+  path.join(process.resourcesPath || '', '.env'),
+  path.join(os.homedir(), '.jarvis', '.env'),
 ];
 for (const p of envCandidates) {
   if (p && fs.existsSync(p)) {
@@ -22,196 +29,102 @@ for (const p of envCandidates) {
 
 const Anthropic = require('@anthropic-ai/sdk');
 const { SerialPort } = require('serialport');
+const { startWebServer } = require('./web-server');
 
 const execAsync = promisify(exec);
 const isDev = !app.isPackaged;
-const RENDERER_URL = isDev ? 'http://localhost:5173' : `file://${path.join(__dirname, '..', 'dist', 'index.html')}`;
+const RENDERER_URL = isDev
+  ? 'http://localhost:5173'
+  : `file://${path.join(__dirname, '..', 'dist', 'index.html')}`;
 
-// YOLO_MODE = true → no confirmation prompts, Jarvis just does it.
-// Set YOLO=false in .env to re-enable safety prompts for destructive ops.
 const YOLO_MODE = process.env.YOLO !== 'false';
+const JARVIS_SOURCE_DIR =
+  process.env.JARVIS_SOURCE_DIR ||
+  path.join(os.homedir(), 'Desktop', 'Jarvis-for-mac-air', 'jarvis-desktop');
+
+// Auth token for phone access — random per launch, stored in ~/.jarvis/phone_token
+function getOrCreatePhoneToken() {
+  const dir = path.join(os.homedir(), '.jarvis');
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, 'phone_token');
+  if (fs.existsSync(p)) return fs.readFileSync(p, 'utf-8').trim();
+  const tok = crypto.randomBytes(16).toString('hex');
+  fs.writeFileSync(p, tok);
+  return tok;
+}
+const PHONE_TOKEN = getOrCreatePhoneToken();
 
 let tray = null;
 let win = null;
 let anthropic = null;
+let webServerHandle = null;
 
 // ============ TOOLS ============
 const tools = [
-  {
-    name: 'run_shell',
-    description: 'Execute any shell/zsh command on macOS. Use for file ops, system info, network, brew, git, anything. Output truncated to 16KB.',
-    input_schema: {
-      type: 'object',
-      properties: { command: { type: 'string' } },
-      required: ['command'],
-    },
-  },
-  {
-    name: 'read_file',
-    description: 'Read contents of any file. Use ~ for home dir.',
-    input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
-  },
-  {
-    name: 'write_file',
-    description: 'Write/overwrite a file. Creates parent dirs if needed.',
-    input_schema: {
-      type: 'object',
-      properties: { path: { type: 'string' }, content: { type: 'string' } },
-      required: ['path', 'content'],
-    },
-  },
-  {
-    name: 'open_app',
-    description: 'Open a macOS application by name (e.g. Safari, VSCode, Spotify, Slack).',
-    input_schema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
-  },
-  {
-    name: 'applescript',
-    description: 'Run AppleScript for advanced macOS automation: control any app, system events, notifications, dialogs, keystroke simulation, etc.',
-    input_schema: { type: 'object', properties: { script: { type: 'string' } }, required: ['script'] },
-  },
-  {
-    name: 'list_dir',
-    description: 'List files in a directory.',
-    input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
-  },
-  {
-    name: 'take_screenshot',
-    description: 'Capture a screenshot of the screen. Returns the path to a saved PNG file in /tmp.',
-    input_schema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'get_clipboard',
-    description: 'Read current clipboard contents (text).',
-    input_schema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'set_clipboard',
-    description: 'Put text into the system clipboard.',
-    input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-  },
-  {
-    name: 'type_text',
-    description: 'Type text into the currently focused app (simulates keyboard). Use for filling out forms, writing in any app, etc.',
-    input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-  },
-  {
-    name: 'key_press',
-    description: 'Send a key combination to the active app. Examples: "cmd+s", "cmd+tab", "return", "escape", "cmd+space".',
-    input_schema: { type: 'object', properties: { keys: { type: 'string' } }, required: ['keys'] },
-  },
-  {
-    name: 'web_fetch',
-    description: 'Fetch the contents of a URL (HTTP GET). Returns first 16KB of response text.',
-    input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
-  },
-  {
-    name: 'notify',
-    description: 'Show a macOS notification with title and message.',
-    input_schema: {
-      type: 'object',
-      properties: { title: { type: 'string' }, message: { type: 'string' } },
-      required: ['title', 'message'],
-    },
-  },
-  {
-    name: 'list_serial_ports',
-    description: 'List all USB/serial devices connected to the Mac (Arduino, ESP32, robots, 3D printers, microcontrollers, etc). Returns port path, vendor, product info.',
-    input_schema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'serial_command',
-    description: 'Send a one-shot command to a serial device and read the response. Opens the port, writes the command, waits for response, then closes. Use for quick interactions with Arduino/robots.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        port: { type: 'string', description: 'Port path like /dev/cu.usbmodem1101' },
-        command: { type: 'string', description: 'Data to send (newline auto-appended)' },
-        baudRate: { type: 'number', description: 'Baud rate (default 9600)' },
-        readTimeoutMs: { type: 'number', description: 'How long to wait for response (default 1500)' },
-      },
-      required: ['port', 'command'],
-    },
-  },
-  {
-    name: 'serial_open',
-    description: 'Open a persistent serial connection to a device. Use this when you need an ongoing session (streaming sensor data, multi-step robot control). Returns a session id.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        port: { type: 'string' },
-        baudRate: { type: 'number' },
-      },
-      required: ['port'],
-    },
-  },
-  {
-    name: 'serial_write',
-    description: 'Write data to an already-open serial session.',
-    input_schema: {
-      type: 'object',
-      properties: { port: { type: 'string' }, data: { type: 'string' } },
-      required: ['port', 'data'],
-    },
-  },
-  {
-    name: 'serial_read',
-    description: 'Read all buffered data from an open serial session (since last read or open).',
-    input_schema: {
-      type: 'object',
-      properties: { port: { type: 'string' } },
-      required: ['port'],
-    },
-  },
-  {
-    name: 'serial_close',
-    description: 'Close a persistent serial session.',
-    input_schema: {
-      type: 'object',
-      properties: { port: { type: 'string' } },
-      required: ['port'],
-    },
-  },
-  {
-    name: 'list_usb_devices',
-    description: 'List all USB devices connected to the Mac with full details (vendor, product, serial, current draw).',
-    input_schema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'list_bluetooth_devices',
-    description: 'List Bluetooth devices (paired + connected).',
-    input_schema: { type: 'object', properties: {} },
-  },
+  { name: 'run_shell', description: 'Execute any zsh command. Output truncated to 16KB. Use for git, brew, file ops, system info, network, anything.', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+  { name: 'read_file', description: 'Read any file. ~ expands to home.', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+  { name: 'write_file', description: 'Write/overwrite a file. Creates parent dirs.', input_schema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
+  { name: 'append_file', description: 'Append text to a file (creates if missing).', input_schema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
+  { name: 'open_app', description: 'Open a macOS app by name (Safari, Spotify, Slack, etc).', input_schema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } },
+  { name: 'applescript', description: 'Run any AppleScript for advanced macOS automation.', input_schema: { type: 'object', properties: { script: { type: 'string' } }, required: ['script'] } },
+  { name: 'list_dir', description: 'List files in a directory.', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+
+  // VISION
+  { name: 'see_screen', description: 'Take a screenshot AND analyze it visually. Use this when the user wants you to see/look at what is on their screen, find something visually, read text from an app, etc. The image is automatically attached to your next response so you can describe what is on screen.', input_schema: { type: 'object', properties: { region: { type: 'string', description: 'Optional: "fullscreen" (default) or "active_window"' } } } },
+  { name: 'take_screenshot_to_file', description: 'Just save a screenshot to disk without analysis.', input_schema: { type: 'object', properties: { path: { type: 'string' } } } },
+
+  // INPUT CONTROL
+  { name: 'get_clipboard', description: 'Read clipboard text.', input_schema: { type: 'object', properties: {} } },
+  { name: 'set_clipboard', description: 'Put text in clipboard.', input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { name: 'type_text', description: 'Type text into focused app (simulates keyboard). Good for filling forms, writing in any app.', input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { name: 'key_press', description: 'Send key combo like "cmd+s", "cmd+tab", "return", "escape", "cmd+space".', input_schema: { type: 'object', properties: { keys: { type: 'string' } }, required: ['keys'] } },
+  { name: 'mouse_click', description: 'Click the mouse at screen coordinates (x,y from top-left). Requires cliclick (`brew install cliclick`).', input_schema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, double: { type: 'boolean' } }, required: ['x', 'y'] } },
+  { name: 'mouse_move', description: 'Move mouse cursor to coordinates without clicking.', input_schema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'] } },
+  { name: 'scroll', description: 'Scroll up or down at current mouse position.', input_schema: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] }, amount: { type: 'number', description: 'lines, default 5' } }, required: ['direction'] } },
+  { name: 'get_screen_size', description: 'Get screen dimensions (width x height).', input_schema: { type: 'object', properties: {} } },
+  { name: 'get_active_window', description: 'Get the name & title of the currently focused app/window.', input_schema: { type: 'object', properties: {} } },
+  { name: 'list_open_apps', description: 'List all currently running/visible apps.', input_schema: { type: 'object', properties: {} } },
+  { name: 'click_ui_element', description: 'Click a named UI element in an app via Accessibility (more reliable than mouse_click). Example: process_name="Safari", element_name="Reload".', input_schema: { type: 'object', properties: { process_name: { type: 'string' }, element_name: { type: 'string' } }, required: ['process_name', 'element_name'] } },
+
+  // SELF-MODIFICATION
+  { name: 'read_own_source', description: 'Read a file from Jarvis own source code. Use relative path like "electron/main.js" or "renderer/App.jsx".', input_schema: { type: 'object', properties: { relative_path: { type: 'string' } }, required: ['relative_path'] } },
+  { name: 'modify_own_source', description: 'Edit Jarvis own source code. Writes content to the file. After modifying, you should tell the user to run `npm run build` from the project dir to apply changes (or call rebuild_self).', input_schema: { type: 'object', properties: { relative_path: { type: 'string' }, content: { type: 'string' } }, required: ['relative_path', 'content'] } },
+  { name: 'list_own_source', description: 'List files in Jarvis source tree.', input_schema: { type: 'object', properties: { relative_path: { type: 'string', description: 'default empty = root' } } } },
+  { name: 'rebuild_self', description: 'Trigger npm run build in the source dir. Takes 3-5 minutes. After done, the user must drag the new .app to /Applications. Returns immediately; build runs in background.', input_schema: { type: 'object', properties: {} } },
+  { name: 'restart_self', description: 'Quit and relaunch Jarvis (useful after edits when running from npm start).', input_schema: { type: 'object', properties: {} } },
+
+  // WEB / SYSTEM
+  { name: 'web_fetch', description: 'GET a URL. Returns first 16KB.', input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
+  { name: 'notify', description: 'Show macOS notification.', input_schema: { type: 'object', properties: { title: { type: 'string' }, message: { type: 'string' } }, required: ['title', 'message'] } },
+  { name: 'speak', description: 'Speak text aloud using macOS TTS.', input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { name: 'open_url', description: 'Open a URL in the default browser.', input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
+
+  // SERIAL / HARDWARE
+  { name: 'list_serial_ports', description: 'List Arduino/USB/serial devices.', input_schema: { type: 'object', properties: {} } },
+  { name: 'serial_command', description: 'Send one command to a serial device, read response, close.', input_schema: { type: 'object', properties: { port: { type: 'string' }, command: { type: 'string' }, baudRate: { type: 'number' }, readTimeoutMs: { type: 'number' } }, required: ['port', 'command'] } },
+  { name: 'serial_open', description: 'Open persistent serial connection.', input_schema: { type: 'object', properties: { port: { type: 'string' }, baudRate: { type: 'number' } }, required: ['port'] } },
+  { name: 'serial_write', description: 'Write to open serial session.', input_schema: { type: 'object', properties: { port: { type: 'string' }, data: { type: 'string' } }, required: ['port', 'data'] } },
+  { name: 'serial_read', description: 'Read buffer from open serial session.', input_schema: { type: 'object', properties: { port: { type: 'string' } }, required: ['port'] } },
+  { name: 'serial_close', description: 'Close serial session.', input_schema: { type: 'object', properties: { port: { type: 'string' } }, required: ['port'] } },
+  { name: 'list_usb_devices', description: 'List USB devices with full details.', input_schema: { type: 'object', properties: {} } },
 ];
 
-const DESTRUCTIVE_PATTERNS = /\b(rm\s+-rf?\s+\/|sudo\s+rm|dd\s+if=|mkfs|shutdown|reboot|>\s*\/dev\/sd|chmod\s+777\s+\/)\b/i;
-
-// Persistent serial sessions
-const serialSessions = new Map(); // port -> { sp, buffer: string }
-
-function ensureSerialBuffer(port, sp) {
-  const session = { sp, buffer: '' };
-  sp.on('data', (chunk) => { session.buffer += chunk.toString('utf8'); });
-  sp.on('error', () => {});
-  serialSessions.set(port, session);
-  return session;
-}
+const DESTRUCTIVE_PATTERNS = /\b(rm\s+-rf?\s+\/(?!tmp|var\/folders|Users\/[^/]+\/(\.cache|Downloads|tmp))|sudo\s+rm\s+-rf|dd\s+if=|mkfs|>\s*\/dev\/sd|chmod\s+777\s+\/)\b/i;
 
 async function confirmAction(summary) {
-  if (YOLO_MODE) return true; // no friction
+  if (YOLO_MODE) return true;
   const result = await dialog.showMessageBox(win, {
     type: 'warning',
     buttons: ['Allow', 'Deny'],
     defaultId: 0,
     cancelId: 1,
-    title: 'Jarvis is about to do this',
+    title: 'Jarvis confirmation',
     message: 'Confirm action',
     detail: summary,
   });
   return result.response === 0;
 }
 
-// Translate "cmd+s" style to AppleScript keystroke
 function keysToAppleScript(combo) {
   const parts = combo.toLowerCase().split('+').map(s => s.trim());
   const mods = [];
@@ -223,7 +136,7 @@ function keysToAppleScript(combo) {
     else if (p === 'ctrl' || p === 'control') mods.push('control down');
     else key = p;
   }
-  const specials = { return: 36, enter: 36, tab: 48, space: 49, escape: 53, delete: 51, up: 126, down: 125, left: 123, right: 124 };
+  const specials = { return: 36, enter: 36, tab: 48, space: 49, escape: 53, esc: 53, delete: 51, up: 126, down: 125, left: 123, right: 124 };
   const using = mods.length ? ` using {${mods.join(', ')}}` : '';
   if (specials[key] !== undefined) {
     return `tell application "System Events" to key code ${specials[key]}${using}`;
@@ -231,17 +144,28 @@ function keysToAppleScript(combo) {
   return `tell application "System Events" to keystroke "${key}"${using}`;
 }
 
+// Persistent serial sessions
+const serialSessions = new Map();
+function ensureSerialBuffer(port, sp) {
+  const session = { sp, buffer: '' };
+  sp.on('data', (chunk) => { session.buffer += chunk.toString('utf8'); });
+  sp.on('error', () => {});
+  serialSessions.set(port, session);
+  return session;
+}
+
 async function executeTool(name, input) {
   try {
     switch (name) {
+      // ----- SHELL / FILES -----
       case 'run_shell': {
         const cmd = input.command;
         if (DESTRUCTIVE_PATTERNS.test(cmd)) {
-          const ok = await confirmAction(`⚠️ Dangerous command:\n\n${cmd}\n\nReally run?`);
-          if (!ok) return { error: 'User denied execution' };
+          const ok = await confirmAction(`⚠️ Dangerous:\n\n${cmd}`);
+          if (!ok) return { error: 'User denied' };
         }
         const { stdout, stderr } = await execAsync(cmd, {
-          timeout: 60000,
+          timeout: 90000,
           maxBuffer: 4 * 1024 * 1024,
           shell: '/bin/zsh',
           env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin` },
@@ -249,17 +173,30 @@ async function executeTool(name, input) {
         return { stdout: (stdout || '').slice(0, 16000), stderr: (stderr || '').slice(0, 4000) };
       }
       case 'read_file': {
-        const p = input.path.replace(/^~/, process.env.HOME);
+        const p = input.path.replace(/^~/, os.homedir());
         const content = fs.readFileSync(p, 'utf-8');
-        return { content: content.slice(0, 32000), truncated: content.length > 32000 };
+        return { content: content.slice(0, 64000), truncated: content.length > 64000 };
       }
       case 'write_file': {
-        const p = input.path.replace(/^~/, process.env.HOME);
-        const ok = await confirmAction(`Write to ${p}\n(${input.content.length} chars)`);
+        const p = input.path.replace(/^~/, os.homedir());
+        const ok = await confirmAction(`Write to:\n${p}\n${input.content.length} chars`);
         if (!ok) return { error: 'User denied write' };
         fs.mkdirSync(path.dirname(p), { recursive: true });
         fs.writeFileSync(p, input.content, 'utf-8');
         return { ok: true, bytes: input.content.length, path: p };
+      }
+      case 'append_file': {
+        const p = input.path.replace(/^~/, os.homedir());
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.appendFileSync(p, input.content, 'utf-8');
+        return { ok: true, path: p };
+      }
+      case 'list_dir': {
+        const p = input.path.replace(/^~/, os.homedir());
+        const items = fs.readdirSync(p, { withFileTypes: true })
+          .slice(0, 500)
+          .map(d => `${d.isDirectory() ? '[DIR] ' : '      '}${d.name}`);
+        return { items };
       }
       case 'open_app': {
         await execAsync(`open -a ${JSON.stringify(input.name)}`);
@@ -269,24 +206,37 @@ async function executeTool(name, input) {
         const { stdout } = await execAsync(`osascript -e ${JSON.stringify(input.script)}`, { timeout: 30000 });
         return { stdout: stdout.trim().slice(0, 8000) };
       }
-      case 'list_dir': {
-        const p = input.path.replace(/^~/, process.env.HOME);
-        const items = fs.readdirSync(p, { withFileTypes: true })
-          .slice(0, 300)
-          .map(d => `${d.isDirectory() ? '[DIR] ' : '      '}${d.name}`);
-        return { items };
+
+      // ----- VISION -----
+      case 'see_screen': {
+        const out = `/tmp/jarvis-vision-${Date.now()}.png`;
+        if (input.region === 'active_window') {
+          await execAsync(`screencapture -x -o -l$(osascript -e 'tell application "System Events" to get id of window 1 of (first process whose frontmost is true)') ${out} 2>/dev/null || screencapture -x ${out}`);
+        } else {
+          await execAsync(`screencapture -x ${out}`);
+        }
+        // Read image as base64 and return marker for agent loop to inject
+        const b64 = fs.readFileSync(out, 'base64');
+        return { _image_b64: b64, _media_type: 'image/png', note: 'Screenshot captured. Image is attached for visual analysis.' };
       }
-      case 'take_screenshot': {
-        const out = `/tmp/jarvis-screenshot-${Date.now()}.png`;
-        await execAsync(`screencapture -x ${out}`);
+      case 'take_screenshot_to_file': {
+        const out = input.path ? input.path.replace(/^~/, os.homedir()) : `/tmp/jarvis-screenshot-${Date.now()}.png`;
+        await execAsync(`screencapture -x ${JSON.stringify(out)}`);
         return { path: out };
       }
+
+      // ----- INPUT -----
       case 'get_clipboard': {
         const { stdout } = await execAsync('pbpaste');
         return { text: stdout.slice(0, 16000) };
       }
       case 'set_clipboard': {
-        await execAsync(`echo ${JSON.stringify(input.text)} | pbcopy`);
+        await execAsync(`pbcopy`, { input: input.text });
+        // Above won't work — need stdin. Use temp file approach:
+        const tmp = `/tmp/jarvis-clip-${Date.now()}.txt`;
+        fs.writeFileSync(tmp, input.text);
+        await execAsync(`pbcopy < ${JSON.stringify(tmp)}`);
+        fs.unlinkSync(tmp);
         return { ok: true };
       }
       case 'type_text': {
@@ -299,10 +249,113 @@ async function executeTool(name, input) {
         await execAsync(`osascript -e ${JSON.stringify(script)}`);
         return { ok: true };
       }
-      case 'web_fetch': {
-        const { stdout } = await execAsync(`curl -sL --max-time 20 ${JSON.stringify(input.url)}`, {
-          maxBuffer: 4 * 1024 * 1024,
+      case 'mouse_click': {
+        try {
+          const cmd = input.double
+            ? `cliclick dc:${Math.round(input.x)},${Math.round(input.y)}`
+            : `cliclick c:${Math.round(input.x)},${Math.round(input.y)}`;
+          await execAsync(`${cmd}`, { env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin` } });
+          return { ok: true };
+        } catch (e) {
+          return { error: 'cliclick not installed. Run: brew install cliclick' };
+        }
+      }
+      case 'mouse_move': {
+        try {
+          await execAsync(`cliclick m:${Math.round(input.x)},${Math.round(input.y)}`, { env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin` } });
+          return { ok: true };
+        } catch (e) {
+          return { error: 'cliclick not installed. Run: brew install cliclick' };
+        }
+      }
+      case 'scroll': {
+        const amount = input.amount || 5;
+        const dir = input.direction === 'up' ? amount : -amount;
+        try {
+          for (let i = 0; i < amount; i++) {
+            await execAsync(`cliclick w:0,${dir > 0 ? '5' : '-5'}`, { env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin` } });
+          }
+          return { ok: true };
+        } catch (e) {
+          const code = input.direction === 'up' ? 116 : 121;
+          for (let i = 0; i < amount; i++) {
+            await execAsync(`osascript -e 'tell application "System Events" to key code ${code}'`);
+          }
+          return { ok: true, method: 'page-keys-fallback', fallback_reason: e.message };
+        }
+      }
+      case 'get_screen_size': {
+        const primary = screen.getPrimaryDisplay();
+        return { width: primary.size.width, height: primary.size.height, scaleFactor: primary.scaleFactor };
+      }
+      case 'get_active_window': {
+        const { stdout } = await execAsync(`osascript -e 'tell application "System Events" to set frontApp to name of first application process whose frontmost is true' -e 'tell application "System Events" to tell (first process whose frontmost is true) to try
+          set winName to name of front window
+        on error
+          set winName to ""
+        end try' -e 'return frontApp & "|" & winName'`);
+        const [app, window] = stdout.trim().split('|');
+        return { app, window };
+      }
+      case 'list_open_apps': {
+        const { stdout } = await execAsync(`osascript -e 'tell application "System Events" to get name of every application process whose background only is false'`);
+        return { apps: stdout.trim().split(', ') };
+      }
+      case 'click_ui_element': {
+        const script = `tell application "System Events" to tell process ${JSON.stringify(input.process_name)}
+          click (first UI element whose name is ${JSON.stringify(input.element_name)})
+        end tell`;
+        const { stdout } = await execAsync(`osascript -e ${JSON.stringify(script)}`);
+        return { ok: true, stdout: stdout.trim() };
+      }
+
+      // ----- SELF MOD -----
+      case 'read_own_source': {
+        const p = path.join(JARVIS_SOURCE_DIR, input.relative_path);
+        if (!p.startsWith(JARVIS_SOURCE_DIR)) return { error: 'Path escapes source dir' };
+        const content = fs.readFileSync(p, 'utf-8');
+        return { path: p, content: content.slice(0, 64000) };
+      }
+      case 'modify_own_source': {
+        const p = path.join(JARVIS_SOURCE_DIR, input.relative_path);
+        if (!p.startsWith(JARVIS_SOURCE_DIR)) return { error: 'Path escapes source dir' };
+        fs.writeFileSync(p, input.content, 'utf-8');
+        return { ok: true, path: p, bytes: input.content.length, note: 'Run rebuild_self to apply changes to the installed .app, or restart if running from npm start.' };
+      }
+      case 'list_own_source': {
+        const p = path.join(JARVIS_SOURCE_DIR, input.relative_path || '');
+        if (!p.startsWith(JARVIS_SOURCE_DIR)) return { error: 'Path escapes source dir' };
+        const items = fs.readdirSync(p, { withFileTypes: true })
+          .filter(d => !d.name.startsWith('.') && d.name !== 'node_modules' && d.name !== 'dist')
+          .map(d => `${d.isDirectory() ? '[DIR] ' : '      '}${d.name}`);
+        return { items };
+      }
+      case 'rebuild_self': {
+        // Spawn detached so it survives a relaunch
+        const child = spawn('bash', ['-lc', `cd ${JSON.stringify(JARVIS_SOURCE_DIR)} && npm run build 2>&1 | tee /tmp/jarvis-rebuild.log`], {
+          detached: true,
+          stdio: 'ignore',
         });
+        child.unref();
+        // Notify when done by tailing log (best-effort)
+        setTimeout(() => {
+          try {
+            execAsync(`osascript -e 'display notification "Build started. Tail /tmp/jarvis-rebuild.log for progress." with title "Jarvis rebuilding…"'`);
+          } catch (e) { /* notification failure non-fatal */ }
+        }, 100);
+        return { ok: true, note: 'Build kicked off in background. Watch /tmp/jarvis-rebuild.log. When done, drag new .app from dist/ to /Applications.' };
+      }
+      case 'restart_self': {
+        setTimeout(() => {
+          app.relaunch();
+          app.exit(0);
+        }, 500);
+        return { ok: true };
+      }
+
+      // ----- WEB / SYSTEM -----
+      case 'web_fetch': {
+        const { stdout } = await execAsync(`curl -sL --max-time 25 ${JSON.stringify(input.url)}`, { maxBuffer: 4 * 1024 * 1024 });
         return { content: stdout.slice(0, 16000) };
       }
       case 'notify': {
@@ -311,17 +364,20 @@ async function executeTool(name, input) {
         await execAsync(`osascript -e 'display notification "${m}" with title "${t}"'`);
         return { ok: true };
       }
+      case 'speak': {
+        const safe = input.text.replace(/"/g, '\\"').slice(0, 4000);
+        execAsync(`say "${safe}"`).catch(() => {});
+        return { ok: true };
+      }
+      case 'open_url': {
+        await shell.openExternal(input.url);
+        return { ok: true };
+      }
+
+      // ----- SERIAL -----
       case 'list_serial_ports': {
         const ports = await SerialPort.list();
-        return {
-          ports: ports.map(p => ({
-            path: p.path,
-            manufacturer: p.manufacturer,
-            vendorId: p.vendorId,
-            productId: p.productId,
-            serialNumber: p.serialNumber,
-          })),
-        };
+        return { ports: ports.map(p => ({ path: p.path, manufacturer: p.manufacturer, vendorId: p.vendorId, productId: p.productId, serialNumber: p.serialNumber })) };
       }
       case 'serial_command': {
         const { port, command, baudRate = 9600, readTimeoutMs = 1500 } = input;
@@ -341,36 +397,35 @@ async function executeTool(name, input) {
         });
       }
       case 'serial_open': {
-        const { port, baudRate = 9600 } = input;
-        if (serialSessions.has(port)) return { ok: true, note: 'already open' };
+        if (serialSessions.has(input.port)) return { ok: true, note: 'already open' };
         return await new Promise((resolve) => {
-          const sp = new SerialPort({ path: port, baudRate }, (err) => {
+          const sp = new SerialPort({ path: input.port, baudRate: input.baudRate || 9600 }, (err) => {
             if (err) { resolve({ error: err.message }); return; }
-            ensureSerialBuffer(port, sp);
-            resolve({ ok: true, port, baudRate });
+            ensureSerialBuffer(input.port, sp);
+            resolve({ ok: true, port: input.port });
           });
         });
       }
       case 'serial_write': {
         const session = serialSessions.get(input.port);
-        if (!session) return { error: 'Port not open. Call serial_open first.' };
+        if (!session) return { error: 'Port not open' };
         return await new Promise((resolve) => {
           session.sp.write(input.data, (err) => {
             if (err) resolve({ error: err.message });
-            else resolve({ ok: true, bytes: input.data.length });
+            else resolve({ ok: true });
           });
         });
       }
       case 'serial_read': {
         const session = serialSessions.get(input.port);
-        if (!session) return { error: 'Port not open. Call serial_open first.' };
+        if (!session) return { error: 'Port not open' };
         const data = session.buffer;
         session.buffer = '';
         return { data: data.slice(0, 16000) };
       }
       case 'serial_close': {
         const session = serialSessions.get(input.port);
-        if (!session) return { error: 'Port not open' };
+        if (!session) return { error: 'Not open' };
         return await new Promise((resolve) => {
           session.sp.close(() => {
             serialSessions.delete(input.port);
@@ -383,29 +438,19 @@ async function executeTool(name, input) {
         try {
           const data = JSON.parse(stdout);
           const flat = [];
-          const walk = (items, depth = 0) => {
+          const walk = (items) => {
             for (const item of items || []) {
-              flat.push({
-                name: item._name,
-                manufacturer: item.manufacturer,
-                vendor_id: item.vendor_id,
-                product_id: item.product_id,
-                serial_num: item.serial_num,
-                speed: item.device_speed || item.host_controller,
-              });
-              if (item._items) walk(item._items, depth + 1);
+              flat.push({ name: item._name, manufacturer: item.manufacturer, vendor_id: item.vendor_id, product_id: item.product_id, serial_num: item.serial_num });
+              if (item._items) walk(item._items);
             }
           };
           walk(data.SPUSBDataType);
-          return { devices: flat.slice(0, 50) };
+          return { devices: flat.slice(0, 80) };
         } catch {
           return { raw: stdout.slice(0, 12000) };
         }
       }
-      case 'list_bluetooth_devices': {
-        const { stdout } = await execAsync('system_profiler SPBluetoothDataType -json', { maxBuffer: 4 * 1024 * 1024 });
-        return { raw: stdout.slice(0, 12000) };
-      }
+
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -415,33 +460,43 @@ async function executeTool(name, input) {
 }
 
 // ============ AGENT LOOP ============
-const SYSTEM = `You are JARVIS — a witty, sharp AI assistant running on the user's MacBook in a menu bar app.
+const SYSTEM = `You are JARVIS — a sharp, witty AI secretary running on the user's MacBook with a menu bar app AND a mobile phone interface.
 
-Personality: confident, concise (2-3 sentences), playful, never sycophantic. Reply naturally — no "I'd be happy to" filler.
+Personality: confident, concise (2-3 sentences typically), playful, never sycophantic. Reply naturally — no "I'd be happy to" filler.
 
-You have FULL control of this Mac via tools: run_shell, read_file, write_file, open_app, applescript, list_dir, take_screenshot, get_clipboard, set_clipboard, type_text, key_press, web_fetch, notify, list_serial_ports, serial_command, serial_open, serial_write, serial_read, serial_close, list_usb_devices, list_bluetooth_devices.
+You have FULL control of this Mac and access to everything. Tools available:
+- Shell, file, app control: run_shell, read_file, write_file, append_file, open_app, applescript, list_dir, open_url
+- Vision (SEE the screen): see_screen — use this whenever the user asks you to look at, find, read, or describe anything visual on screen
+- Input control: type_text, key_press, mouse_click, mouse_move, scroll, click_ui_element
+- Screen info: get_screen_size, get_active_window, list_open_apps
+- Self-modification: read_own_source, modify_own_source, list_own_source, rebuild_self, restart_self
+- Hardware: list_serial_ports, serial_command, serial_open/write/read/close (Arduinos, robots, microcontrollers), list_usb_devices
+- Clipboard: get_clipboard, set_clipboard
+- Web: web_fetch, open_url
+- Output: notify, speak
 
-You can also control HARDWARE connected via USB/serial — Arduinos, robots, ESP32s, 3D printers, microcontrollers. Use list_serial_ports first to find devices, then serial_command for quick one-shots or serial_open/write/read/close for ongoing sessions.
+Working style:
+- Act like a great secretary: just DO things, don't ask permission for normal tasks
+- For multi-step tasks (e.g. "open Notes and write me a poem"), chain tools yourself without checking in
+- When the user wants visual context, call see_screen FIRST, then act
+- After completing, give a one-line summary
+- If a tool fails, try a different approach or briefly explain why
+- For sensitive ops (rm -rf /, format drive), the system auto-prompts — proceed normally
+- When modifying your own code, default to surgical edits with read_own_source first. After major edits, suggest rebuild_self.
+- Be senior-engineer direct for code questions.
 
-Style:
-- Just DO things. Don't ask permission for normal stuff — the user wants speed.
-- For multi-step tasks, chain tools yourself without checking in.
-- After tools complete, give the user a one-line summary of what happened.
-- If something fails, briefly say why and try a different approach.
-- For coding: be senior-engineer direct with working examples.
-- When user asks you to "remember" something, write it to ~/.jarvis/memory.md (append, with timestamp).`;
+You exist to make the user's Mac do anything they want.`;
 
-const conversations = new Map(); // sessionId -> messages[]
+const conversations = new Map();
 
 function trimHistory(history) {
-  // Keep last 40 messages to avoid context bloat
-  if (history.length > 40) return history.slice(-40);
+  if (history.length > 50) return history.slice(-50);
   return history;
 }
 
 async function runAgent(sessionId, userText, onEvent) {
   if (!anthropic) {
-    onEvent({ type: 'error', message: 'Missing ANTHROPIC_API_KEY in .env file. Add it and restart.' });
+    onEvent({ type: 'error', message: 'Missing ANTHROPIC_API_KEY in ~/.jarvis/.env' });
     onEvent({ type: 'done' });
     return;
   }
@@ -452,7 +507,7 @@ async function runAgent(sessionId, userText, onEvent) {
 
   try {
     let iterations = 0;
-    while (iterations++ < 25) {
+    while (iterations++ < 30) {
       onEvent({ type: 'status', state: 'thinking' });
 
       const stream = await anthropic.messages.stream({
@@ -464,19 +519,15 @@ async function runAgent(sessionId, userText, onEvent) {
       });
 
       let currentToolUse = null;
-      let currentText = '';
 
       for await (const event of stream) {
         if (event.type === 'content_block_start') {
           if (event.content_block.type === 'tool_use') {
             currentToolUse = { id: event.content_block.id, name: event.content_block.name, input: '' };
             onEvent({ type: 'tool_start', name: currentToolUse.name });
-          } else if (event.content_block.type === 'text') {
-            currentText = '';
           }
         } else if (event.type === 'content_block_delta') {
           if (event.delta.type === 'text_delta') {
-            currentText += event.delta.text;
             onEvent({ type: 'delta', content: event.delta.text });
           } else if (event.delta.type === 'input_json_delta' && currentToolUse) {
             currentToolUse.input += event.delta.partial_json;
@@ -499,17 +550,31 @@ async function runAgent(sessionId, userText, onEvent) {
         return;
       }
 
-      // Execute tool calls
       const toolResults = [];
       for (const block of finalMsg.content) {
         if (block.type === 'tool_use') {
           onEvent({ type: 'tool_call', name: block.name, input: block.input });
           const result = await executeTool(block.name, block.input);
-          onEvent({ type: 'tool_result', name: block.name, result });
+
+          // Auto-inject image into tool_result for see_screen
+          let resultContent;
+          if (result._image_b64) {
+            onEvent({ type: 'tool_result', name: block.name, result: { ok: true, note: 'image attached' } });
+            resultContent = [
+              { type: 'text', text: result.note || 'Screenshot captured.' },
+              { type: 'image', source: { type: 'base64', media_type: result._media_type || 'image/png', data: result._image_b64 } },
+            ];
+          } else {
+            const safeForUi = { ...result };
+            delete safeForUi._image_b64;
+            onEvent({ type: 'tool_result', name: block.name, result: safeForUi });
+            resultContent = JSON.stringify(safeForUi).slice(0, 12000);
+          }
+
           toolResults.push({
             type: 'tool_result',
             tool_use_id: block.id,
-            content: JSON.stringify(result).slice(0, 12000),
+            content: resultContent,
             is_error: !!result.error,
           });
         }
@@ -517,7 +582,7 @@ async function runAgent(sessionId, userText, onEvent) {
       history.push({ role: 'user', content: toolResults });
       history = trimHistory(history);
     }
-    onEvent({ type: 'error', message: 'Hit 25-iteration cap — try a simpler request' });
+    onEvent({ type: 'error', message: 'Hit 30-iteration cap' });
   } catch (e) {
     console.error('runAgent error', e);
     onEvent({ type: 'error', message: (e.message || String(e)).slice(0, 500) });
@@ -574,9 +639,8 @@ function toggleWindow() {
 function createTray() {
   const iconPath = path.join(__dirname, 'trayIconTemplate.png');
   let img;
-  if (fs.existsSync(iconPath)) {
-    img = nativeImage.createFromPath(iconPath);
-  } else {
+  if (fs.existsSync(iconPath)) img = nativeImage.createFromPath(iconPath);
+  else {
     img = nativeImage.createFromBuffer(Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAUklEQVR4nGNgGAWjYBSMglEwCkbBKBg6QJ' +
       'YR/v//YwxOgIyABYQowSiBEYwGI4ZsKsAFGEqWAsYwQbA6sGAYIxoBuMpgFEwCkbBKBgFowAA4GcGNCYK' +
@@ -584,12 +648,13 @@ function createTray() {
   }
   img.setTemplateImage(true);
   tray = new Tray(img);
-  tray.setToolTip(`Jarvis ${YOLO_MODE ? '(YOLO)' : ''}`);
+  tray.setToolTip('Jarvis');
   tray.on('click', toggleWindow);
   tray.on('right-click', () => {
     const menu = Menu.buildFromTemplate([
       { label: 'Toggle Jarvis', click: toggleWindow },
       { label: `YOLO Mode: ${YOLO_MODE ? 'ON' : 'OFF'}`, enabled: false },
+      { label: `Phone URL: see Jarvis settings`, enabled: false },
       { label: 'Hotkey: ⌘⇧Space', enabled: false },
       { type: 'separator' },
       { label: 'Quit Jarvis', role: 'quit' },
@@ -600,16 +665,19 @@ function createTray() {
 
 // ============ IPC ============
 ipcMain.handle('jarvis:send', async (event, { sessionId, message }) => {
-  await runAgent(sessionId, message, (ev) => {
-    event.sender.send('jarvis:event', ev);
-  });
+  await runAgent(sessionId, message, (ev) => event.sender.send('jarvis:event', ev));
 });
-
 ipcMain.handle('jarvis:has-key', () => !!process.env.ANTHROPIC_API_KEY);
 ipcMain.handle('jarvis:hide', () => win && win.hide());
 ipcMain.handle('jarvis:reset', (event, { sessionId }) => {
   conversations.delete(sessionId);
   return { ok: true };
+});
+ipcMain.handle('jarvis:phone-info', async () => {
+  if (!webServerHandle) return null;
+  const url = webServerHandle.getUrl(PHONE_TOKEN);
+  const qr = await webServerHandle.getQrDataUrl(PHONE_TOKEN);
+  return { url, qr };
 });
 
 // ============ LIFECYCLE ============
@@ -621,6 +689,18 @@ app.whenReady().then(() => {
   createTray();
   createWindow();
   globalShortcut.register('CommandOrControl+Shift+Space', toggleWindow);
+
+  // Start phone web server
+  try {
+    webServerHandle = startWebServer({
+      onMessage: async (sessionId, message, send) => {
+        await runAgent(`phone-${sessionId}`, message, send);
+      },
+      getAuth: () => PHONE_TOKEN,
+    });
+  } catch (e) {
+    console.error('phone server failed', e);
+  }
 });
 
 app.on('will-quit', () => globalShortcut.unregisterAll());

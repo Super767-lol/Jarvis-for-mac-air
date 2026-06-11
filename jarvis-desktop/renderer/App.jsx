@@ -21,6 +21,19 @@ export default function App() {
   const transcriptRef = useRef(null);
   const recognitionRef = useRef(null);
   const synthRef = useRef(window.speechSynthesis);
+  const watchdogRef = useRef(null);
+
+  const armWatchdog = () => {
+    if (watchdogRef.current) clearTimeout(watchdogRef.current);
+    watchdogRef.current = setTimeout(() => {
+      pushLog('err', 'no response in 60s — reset');
+      setState('idle');
+    }, 60000);
+  };
+  const clearWatchdog = () => {
+    if (watchdogRef.current) clearTimeout(watchdogRef.current);
+    watchdogRef.current = null;
+  };
 
   useEffect(() => { localStorage.setItem('jarvis_sid', sessionId); }, [sessionId]);
 
@@ -61,6 +74,7 @@ export default function App() {
 
   useEffect(() => {
     const off = window.jarvis.onEvent((ev) => {
+      armWatchdog();
       if (ev.type === 'delta') {
         setMessages((m) => {
           const last = m[m.length - 1];
@@ -71,9 +85,10 @@ export default function App() {
         });
       } else if (ev.type === 'status') setState(ev.state);
       else if (ev.type === 'tool_start') { setState('tool'); pushLog('tool', `→ ${ev.name}`); }
-      else if (ev.type === 'tool_call') pushLog('tool', `${ev.name}(${JSON.stringify(ev.input).slice(0, 60)})`);
-      else if (ev.type === 'tool_result') pushLog(ev.result.error ? 'err' : 'ok', `${ev.name} ${ev.result.error ? '✗' : '✓'}`);
+      else if (ev.type === 'tool_call') pushLog('tool', `${ev.name}(${JSON.stringify(ev.input).slice(0, 80)})`);
+      else if (ev.type === 'tool_result') pushLog(ev.result.error ? 'err' : 'ok', `${ev.name} ${ev.result.error ? '✗ ' + ev.result.error.slice(0, 60) : '✓'}`);
       else if (ev.type === 'done') {
+        clearWatchdog();
         setMessages((m) => {
           if (!m.length) return m;
           const last = m[m.length - 1];
@@ -83,7 +98,7 @@ export default function App() {
         pushLog('ok', 'task complete');
         if (!voiceEnabled) setState('idle');
       }
-      else if (ev.type === 'error') { pushLog('err', ev.message); setState('idle'); }
+      else if (ev.type === 'error') { clearWatchdog(); pushLog('err', ev.message); setState('idle'); }
     });
     return off;
   }, [voiceEnabled]);
@@ -94,8 +109,17 @@ export default function App() {
     setInput('');
     setMessages((m) => [...m, { id: crypto.randomUUID(), role: 'user', content: text }]);
     pushLog('user', `> ${text.slice(0, 80)}`);
+    armWatchdog();
     window.jarvis.send(sessionId, text);
   }, [input, sessionId]);
+
+  const resetConversation = async () => {
+    await window.jarvis.reset({ sessionId });
+    setMessages([]);
+    setToolLog([{ t: 'info', m: 'conversation reset' }]);
+    setState('idle');
+    clearWatchdog();
+  };
 
   const toggleMic = () => {
     if (!recognitionRef.current) return;
@@ -113,6 +137,8 @@ export default function App() {
             <span className="text-[10px] uppercase tracking-[0.3em] font-mono text-white/50">JARVIS</span>
           </div>
           <div className="flex items-center gap-1" data-no-drag>
+            <button onClick={resetConversation} title="Reset conversation"
+              className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">↻</button>
             <button onClick={() => setShowTranscript((v) => !v)}
               className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">⌨</button>
             <button onClick={() => setVoiceEnabled((v) => !v)}

@@ -9,6 +9,7 @@ const { promisify } = require('util');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const Anthropic = require('@anthropic-ai/sdk');
+const { SerialPort } = require('serialport');
 
 const execAsync = promisify(exec);
 const isDev = !app.isPackaged;
@@ -101,9 +102,88 @@ const tools = [
       required: ['title', 'message'],
     },
   },
+  {
+    name: 'list_serial_ports',
+    description: 'List all USB/serial devices connected to the Mac (Arduino, ESP32, robots, 3D printers, microcontrollers, etc). Returns port path, vendor, product info.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'serial_command',
+    description: 'Send a one-shot command to a serial device and read the response. Opens the port, writes the command, waits for response, then closes. Use for quick interactions with Arduino/robots.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        port: { type: 'string', description: 'Port path like /dev/cu.usbmodem1101' },
+        command: { type: 'string', description: 'Data to send (newline auto-appended)' },
+        baudRate: { type: 'number', description: 'Baud rate (default 9600)' },
+        readTimeoutMs: { type: 'number', description: 'How long to wait for response (default 1500)' },
+      },
+      required: ['port', 'command'],
+    },
+  },
+  {
+    name: 'serial_open',
+    description: 'Open a persistent serial connection to a device. Use this when you need an ongoing session (streaming sensor data, multi-step robot control). Returns a session id.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        port: { type: 'string' },
+        baudRate: { type: 'number' },
+      },
+      required: ['port'],
+    },
+  },
+  {
+    name: 'serial_write',
+    description: 'Write data to an already-open serial session.',
+    input_schema: {
+      type: 'object',
+      properties: { port: { type: 'string' }, data: { type: 'string' } },
+      required: ['port', 'data'],
+    },
+  },
+  {
+    name: 'serial_read',
+    description: 'Read all buffered data from an open serial session (since last read or open).',
+    input_schema: {
+      type: 'object',
+      properties: { port: { type: 'string' } },
+      required: ['port'],
+    },
+  },
+  {
+    name: 'serial_close',
+    description: 'Close a persistent serial session.',
+    input_schema: {
+      type: 'object',
+      properties: { port: { type: 'string' } },
+      required: ['port'],
+    },
+  },
+  {
+    name: 'list_usb_devices',
+    description: 'List all USB devices connected to the Mac with full details (vendor, product, serial, current draw).',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'list_bluetooth_devices',
+    description: 'List Bluetooth devices (paired + connected).',
+    input_schema: { type: 'object', properties: {} },
+  },
 ];
 
 const DESTRUCTIVE_PATTERNS = /\b(rm\s+-rf?\s+\/|sudo\s+rm|dd\s+if=|mkfs|shutdown|reboot|>\s*\/dev\/sd|chmod\s+777\s+\/)\b/i;
+
+// Persistent serial sessions
+const serialSessions = new Map(); // port -> { sp, buffer: string }
+
+function ensureSerialBuffer(port, sp) {
+  const session = { sp, buffer: '' };
+  sp.on('data', (chunk) => { session.buffer += chunk.toString('utf8'); });
+  sp.on('error', () => {});
+  serialSessions.set(port, session);
+  return session;
+}
 
 async function confirmAction(summary) {
   if (YOLO_MODE) return true; // no friction
@@ -219,6 +299,101 @@ async function executeTool(name, input) {
         await execAsync(`osascript -e 'display notification "${m}" with title "${t}"'`);
         return { ok: true };
       }
+      case 'list_serial_ports': {
+        const ports = await SerialPort.list();
+        return {
+          ports: ports.map(p => ({
+            path: p.path,
+            manufacturer: p.manufacturer,
+            vendorId: p.vendorId,
+            productId: p.productId,
+            serialNumber: p.serialNumber,
+          })),
+        };
+      }
+      case 'serial_command': {
+        const { port, command, baudRate = 9600, readTimeoutMs = 1500 } = input;
+        return await new Promise((resolve) => {
+          const sp = new SerialPort({ path: port, baudRate }, (err) => {
+            if (err) { resolve({ error: err.message }); return; }
+            let buf = '';
+            sp.on('data', (c) => { buf += c.toString('utf8'); });
+            sp.write(command.endsWith('\n') ? command : command + '\n', (werr) => {
+              if (werr) { sp.close(() => {}); resolve({ error: werr.message }); return; }
+              setTimeout(() => {
+                sp.close(() => {});
+                resolve({ response: buf.slice(0, 16000) });
+              }, readTimeoutMs);
+            });
+          });
+        });
+      }
+      case 'serial_open': {
+        const { port, baudRate = 9600 } = input;
+        if (serialSessions.has(port)) return { ok: true, note: 'already open' };
+        return await new Promise((resolve) => {
+          const sp = new SerialPort({ path: port, baudRate }, (err) => {
+            if (err) { resolve({ error: err.message }); return; }
+            ensureSerialBuffer(port, sp);
+            resolve({ ok: true, port, baudRate });
+          });
+        });
+      }
+      case 'serial_write': {
+        const session = serialSessions.get(input.port);
+        if (!session) return { error: 'Port not open. Call serial_open first.' };
+        return await new Promise((resolve) => {
+          session.sp.write(input.data, (err) => {
+            if (err) resolve({ error: err.message });
+            else resolve({ ok: true, bytes: input.data.length });
+          });
+        });
+      }
+      case 'serial_read': {
+        const session = serialSessions.get(input.port);
+        if (!session) return { error: 'Port not open. Call serial_open first.' };
+        const data = session.buffer;
+        session.buffer = '';
+        return { data: data.slice(0, 16000) };
+      }
+      case 'serial_close': {
+        const session = serialSessions.get(input.port);
+        if (!session) return { error: 'Port not open' };
+        return await new Promise((resolve) => {
+          session.sp.close(() => {
+            serialSessions.delete(input.port);
+            resolve({ ok: true });
+          });
+        });
+      }
+      case 'list_usb_devices': {
+        const { stdout } = await execAsync('system_profiler SPUSBDataType -json', { maxBuffer: 4 * 1024 * 1024 });
+        try {
+          const data = JSON.parse(stdout);
+          const flat = [];
+          const walk = (items, depth = 0) => {
+            for (const item of items || []) {
+              flat.push({
+                name: item._name,
+                manufacturer: item.manufacturer,
+                vendor_id: item.vendor_id,
+                product_id: item.product_id,
+                serial_num: item.serial_num,
+                speed: item.device_speed || item.host_controller,
+              });
+              if (item._items) walk(item._items, depth + 1);
+            }
+          };
+          walk(data.SPUSBDataType);
+          return { devices: flat.slice(0, 50) };
+        } catch {
+          return { raw: stdout.slice(0, 12000) };
+        }
+      }
+      case 'list_bluetooth_devices': {
+        const { stdout } = await execAsync('system_profiler SPBluetoothDataType -json', { maxBuffer: 4 * 1024 * 1024 });
+        return { raw: stdout.slice(0, 12000) };
+      }
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -232,7 +407,9 @@ const SYSTEM = `You are JARVIS — a witty, sharp AI assistant running on the us
 
 Personality: confident, concise (2-3 sentences), playful, never sycophantic. Reply naturally — no "I'd be happy to" filler.
 
-You have FULL control of this Mac via tools: run_shell, read_file, write_file, open_app, applescript, list_dir, take_screenshot, get_clipboard, set_clipboard, type_text, key_press, web_fetch, notify.
+You have FULL control of this Mac via tools: run_shell, read_file, write_file, open_app, applescript, list_dir, take_screenshot, get_clipboard, set_clipboard, type_text, key_press, web_fetch, notify, list_serial_ports, serial_command, serial_open, serial_write, serial_read, serial_close, list_usb_devices, list_bluetooth_devices.
+
+You can also control HARDWARE connected via USB/serial — Arduinos, robots, ESP32s, 3D printers, microcontrollers. Use list_serial_ports first to find devices, then serial_command for quick one-shots or serial_open/write/read/close for ongoing sessions.
 
 Style:
 - Just DO things. Don't ask permission for normal stuff — the user wants speed.

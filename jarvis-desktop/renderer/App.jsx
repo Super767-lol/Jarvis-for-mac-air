@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Orb from './Orb.jsx';
+import HelmetIntro from './HelmetIntro.jsx';
 
 const STATUS = { idle: 'Ready', listening: 'Listening…', thinking: 'Thinking…', speaking: 'Speaking…', tool: 'Working…' };
 
@@ -12,6 +13,11 @@ export default function App() {
   const [showTranscript, setShowTranscript] = useState(false);
   const [showPhone, setShowPhone] = useState(false);
   const [phoneInfo, setPhoneInfo] = useState(null);
+  const [showRobot, setShowRobot] = useState(false);
+  const [devices, setDevices] = useState([]);
+  const [serialFeed, setSerialFeed] = useState([]);
+  const [intro, setIntro] = useState(null);
+  const introPlayedRef = useRef(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [hasKey, setHasKey] = useState(true);
   const [toolLog, setToolLog] = useState([
@@ -43,6 +49,24 @@ export default function App() {
     window.jarvis.hasKey().then(setHasKey);
     window.jarvis.phoneInfo().then(setPhoneInfo).catch(() => {});
   }, []);
+
+  const refreshDevices = () => window.jarvis.listPorts().then(setDevices).catch(() => {});
+
+  useEffect(() => {
+    const offShown = window.jarvis.onShown(() => {
+      setIntro(introPlayedRef.current ? 'mini' : 'full');
+      introPlayedRef.current = true;
+    });
+    const offDevice = window.jarvis.onDevice((d) => {
+      pushLog('hw', `${d.action === 'connected' ? '🔌' : '⏏'} ${d.action}: ${d.label}`);
+      refreshDevices();
+    });
+    const offSerial = window.jarvis.onSerialData((p) => {
+      setSerialFeed((f) => [...f.slice(-200), { port: p.port, data: p.data, ts: Date.now() }]);
+    });
+    refreshDevices();
+    return () => { offShown(); offDevice(); offSerial(); };
+  }, []); // eslint-disable-line
 
   useEffect(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -140,7 +164,9 @@ export default function App() {
             <span className="text-[10px] uppercase tracking-[0.3em] font-mono text-white/50">JARVIS</span>
           </div>
           <div className="flex items-center gap-1" data-no-drag>
-            <button onClick={() => setShowPhone((v) => !v)} title="Phone access"
+            <button data-testid="robot-panel-btn" onClick={() => { setShowRobot((v) => !v); setShowPhone(false); }} title="Robot mode"
+              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs hover:bg-white/10 ${showRobot ? 'text-amber-300' : 'text-white/50 hover:text-white'}`}>🤖</button>
+            <button onClick={() => { setShowPhone((v) => !v); setShowRobot(false); }} title="Phone access"
               className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">📱</button>
             <button onClick={resetConversation} title="Reset conversation"
               className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">↻</button>
@@ -168,6 +194,43 @@ export default function App() {
               : <span className="text-white/40">{STATUS[state]}</span>}
           </div>
         </div>
+
+        {/* Robot panel */}
+        <AnimatePresence>
+          {showRobot && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+              className="absolute inset-x-0 top-12 bottom-28 bg-black/80 backdrop-blur-xl border-t border-white/5 px-5 py-4 overflow-y-auto z-30 flex flex-col gap-3"
+              data-no-drag data-testid="robot-panel"
+            >
+              <div className="flex items-center justify-between">
+                <div className="text-[11px] uppercase tracking-[0.3em] font-mono text-amber-300/80">robot mode</div>
+                <button data-testid="robot-rescan-btn" onClick={refreshDevices}
+                  className="text-[10px] font-mono text-white/40 hover:text-white">↻ rescan</button>
+              </div>
+              {devices.length === 0 ? (
+                <div className="text-xs text-white/40 font-mono" data-testid="robot-no-devices">no devices detected — plug a board into USB</div>
+              ) : devices.map((d) => (
+                <div key={d.path} className="bg-white/5 border border-white/10 rounded-lg px-3 py-2" data-testid="robot-device-item">
+                  <div className="text-xs text-white font-mono">{d.path}</div>
+                  <div className="text-[10px] text-white/40">{d.manufacturer || 'unknown'}{d.vendorId ? ` · ${d.vendorId}:${d.productId}` : ''}</div>
+                </div>
+              ))}
+              <div className="text-[10px] uppercase tracking-[0.3em] font-mono text-white/40 mt-1">serial monitor</div>
+              <div className="flex-1 min-h-[80px] bg-black/60 rounded-lg p-2 overflow-y-auto font-mono text-[10px] text-emerald-300/80 whitespace-pre-wrap" data-testid="serial-monitor">
+                {serialFeed.length === 0
+                  ? <span className="text-white/25">waiting for serial data… Jarvis streams board output here when working with your robot</span>
+                  : serialFeed.slice(-60).map((l, i) => (
+                      <div key={`${l.ts}-${i}`}><span className="text-white/30">{l.port.split('/').pop()}▸</span> {l.data}</div>
+                    ))}
+              </div>
+              <div className="text-[10px] text-white/35 leading-relaxed">
+                Ask Jarvis: "write code for my Arduino and flash it" — it compiles &amp; uploads via arduino-cli.<br />
+                One-time setup: <code className="text-amber-300/80">brew install arduino-cli</code>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Transcript overlay */}
         <AnimatePresence>
@@ -256,6 +319,16 @@ export default function App() {
             <button onClick={() => handleSend()} className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center hover:bg-white/90 active:scale-95">→</button>
           )}
         </div>
+
+        {/* Helmet intro overlay */}
+        <AnimatePresence>
+          {intro && (
+            <motion.div key={`intro-${intro}`} exit={{ opacity: 0, transition: { duration: 0.3 } }}
+              className="absolute inset-0 z-50" data-no-drag data-testid="helmet-intro">
+              <HelmetIntro variant={intro} onComplete={() => setIntro(null)} />
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </div>
   );

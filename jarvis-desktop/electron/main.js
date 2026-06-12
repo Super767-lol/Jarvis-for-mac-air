@@ -108,6 +108,11 @@ const tools = [
   { name: 'serial_read', description: 'Read buffer from open serial session.', input_schema: { type: 'object', properties: { port: { type: 'string' } }, required: ['port'] } },
   { name: 'serial_close', description: 'Close serial session.', input_schema: { type: 'object', properties: { port: { type: 'string' } }, required: ['port'] } },
   { name: 'list_usb_devices', description: 'List USB devices with full details.', input_schema: { type: 'object', properties: {} } },
+
+  // ROBOT MODE
+  { name: 'detect_boards', description: 'Detect connected Arduino/microcontroller boards with board type + FQBN identification (uses arduino-cli if installed, falls back to raw serial list). Use when the user asks what is plugged in, or before flashing.', input_schema: { type: 'object', properties: {} } },
+  { name: 'arduino_flash', description: 'Compile an Arduino sketch and upload it to a connected board via arduino-cli. Writes the sketch to ~/.jarvis/sketches/<name>/, auto-installs the board core if needed, compiles, then uploads. Requires arduino-cli (brew install arduino-cli). Common FQBNs: arduino:avr:uno, arduino:avr:nano, arduino:avr:mega, esp32:esp32:esp32, arduino:renesas_uno:unor4wifi.', input_schema: { type: 'object', properties: { sketch_code: { type: 'string', description: 'Complete .ino sketch code' }, port: { type: 'string', description: 'Serial port path e.g. /dev/cu.usbmodem1101' }, fqbn: { type: 'string', description: 'Fully qualified board name' }, sketch_name: { type: 'string', description: 'Optional sketch folder name' } }, required: ['sketch_code', 'port', 'fqbn'] } },
+  { name: 'arduino_cli', description: 'Run any raw arduino-cli command (e.g. "lib install Servo", "core search esp32", "board listall"). Pass args only, without the arduino-cli prefix.', input_schema: { type: 'object', properties: { args: { type: 'string' } }, required: ['args'] } },
 ];
 
 const DESTRUCTIVE_PATTERNS = /\b(rm\s+-rf?\s+\/(?!tmp|var\/folders|Users\/[^/]+\/(\.cache|Downloads|tmp))|sudo\s+rm\s+-rf|dd\s+if=|mkfs|>\s*\/dev\/sd|chmod\s+777\s+\/)\b/i;
@@ -149,10 +154,46 @@ function keysToAppleScript(combo) {
 const serialSessions = new Map();
 function ensureSerialBuffer(port, sp) {
   const session = { sp, buffer: '' };
-  sp.on('data', (chunk) => { session.buffer += chunk.toString('utf8'); });
+  sp.on('data', (chunk) => {
+    const text = chunk.toString('utf8');
+    session.buffer += text;
+    if (session.buffer.length > 64000) session.buffer = session.buffer.slice(-64000);
+    try { win?.webContents.send('jarvis:serial-data', { port, data: text }); } catch { /* window gone */ }
+  });
   sp.on('error', () => {});
   serialSessions.set(port, session);
   return session;
+}
+
+const BREW_ENV = { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin` };
+
+// ============ DEVICE WATCHER (Robot Mode) ============
+const pendingHwEvents = [];
+let knownPorts = null;
+function startDeviceWatcher() {
+  setInterval(async () => {
+    try {
+      const ports = await SerialPort.list();
+      const current = new Map(ports.map((p) => [p.path, p]));
+      if (knownPorts) {
+        for (const [pp, p] of current) {
+          if (!knownPorts.has(pp)) {
+            const label = [p.manufacturer, pp].filter(Boolean).join(' — ') || pp;
+            pendingHwEvents.push(`connected: ${label}`);
+            win?.webContents.send('jarvis:device', { action: 'connected', path: pp, label });
+            execAsync(`osascript -e 'display notification "${label.replace(/"/g, '')}" with title "Jarvis — device connected"'`).catch(() => {});
+          }
+        }
+        for (const pp of knownPorts.keys()) {
+          if (!current.has(pp)) {
+            pendingHwEvents.push(`disconnected: ${pp}`);
+            win?.webContents.send('jarvis:device', { action: 'disconnected', path: pp, label: pp });
+          }
+        }
+      }
+      knownPorts = current;
+    } catch { /* transient serial enumeration failure */ }
+  }, 4000);
 }
 
 async function executeTool(name, input) {
@@ -452,6 +493,54 @@ async function executeTool(name, input) {
         }
       }
 
+      // ----- ROBOT MODE -----
+      case 'detect_boards': {
+        try {
+          const { stdout } = await execAsync('arduino-cli board list --format json', { env: BREW_ENV, timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
+          const data = JSON.parse(stdout);
+          const entries = Array.isArray(data) ? data : (data.detected_ports || []);
+          const boards = entries.map((e) => ({
+            port: e.port?.address || e.address,
+            protocol: e.port?.protocol || e.protocol,
+            boards: (e.matching_boards || e.boards || []).map((b) => ({ name: b.name, fqbn: b.fqbn })),
+          }));
+          return { via: 'arduino-cli', boards };
+        } catch (e) {
+          const ports = await SerialPort.list();
+          return {
+            via: 'serial-fallback',
+            note: 'arduino-cli not available — board types unknown. To enable flashing: brew install arduino-cli',
+            ports: ports.map((p) => ({ path: p.path, manufacturer: p.manufacturer, vendorId: p.vendorId, productId: p.productId })),
+          };
+        }
+      }
+      case 'arduino_flash': {
+        try { await execAsync('arduino-cli version', { env: BREW_ENV, timeout: 10000 }); }
+        catch { return { error: 'arduino-cli is not installed. Tell the user to run: brew install arduino-cli' }; }
+        const sketchName = (input.sketch_name || 'jarvis_sketch').replace(/[^a-zA-Z0-9_]/g, '_');
+        const dir = path.join(os.homedir(), '.jarvis', 'sketches', sketchName);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, `${sketchName}.ino`), input.sketch_code, 'utf-8');
+        // Release the port if we hold a session on it (upload needs exclusive access)
+        const held = serialSessions.get(input.port);
+        if (held) { await new Promise((r) => held.sp.close(() => r())); serialSessions.delete(input.port); }
+        const core = input.fqbn.split(':').slice(0, 2).join(':');
+        let coreNote;
+        try { await execAsync(`arduino-cli core install ${core}`, { env: BREW_ENV, timeout: 300000, maxBuffer: 8 * 1024 * 1024 }); }
+        catch (e) { coreNote = `core install warning: ${(e.message || '').slice(0, 200)}`; }
+        try {
+          const { stdout: cOut } = await execAsync(`arduino-cli compile --fqbn ${input.fqbn} ${JSON.stringify(dir)}`, { env: BREW_ENV, timeout: 300000, maxBuffer: 8 * 1024 * 1024 });
+          const { stdout: uOut } = await execAsync(`arduino-cli upload -p ${input.port} --fqbn ${input.fqbn} ${JSON.stringify(dir)}`, { env: BREW_ENV, timeout: 120000, maxBuffer: 8 * 1024 * 1024 });
+          return { ok: true, flashed: true, sketch_dir: dir, compile: (cOut || '').slice(-1500), upload: (uOut || '').slice(-1500), note: coreNote };
+        } catch (e) {
+          return { error: `Flash failed: ${(e.message || '').slice(0, 2500)}`, sketch_dir: dir };
+        }
+      }
+      case 'arduino_cli': {
+        const { stdout, stderr } = await execAsync(`arduino-cli ${input.args}`, { env: BREW_ENV, timeout: 300000, maxBuffer: 8 * 1024 * 1024 });
+        return { stdout: (stdout || '').slice(0, 12000), stderr: (stderr || '').slice(0, 3000) };
+      }
+
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -474,9 +563,16 @@ You have FULL control of this Mac and access to everything. Tools available:
 - Screen info: get_screen_size, get_active_window, list_open_apps
 - Self-modification: read_own_source, modify_own_source, list_own_source, rebuild_self, restart_self
 - Hardware: list_serial_ports, serial_command, serial_open/write/read/close, list_usb_devices
+- Robot Mode: detect_boards, arduino_flash (compile + upload sketches), arduino_cli
 - Clipboard: get_clipboard, set_clipboard
 - Web: web_fetch, open_url
 - Output: notify, speak
+
+ROBOT MODE:
+- Boards/robots plugged into USB are auto-detected; you'll get a [System note] about connect/disconnect events. When that happens, ACKNOWLEDGE it briefly ("I see your Arduino on /dev/cu.usbmodem…") but DO NOT probe, code, or flash it until the user explicitly asks you to.
+- When the user asks you to program a robot/board: write the complete Arduino (C/C++) sketch yourself, pick the right FQBN (detect_boards tells you), then arduino_flash compiles + uploads in one shot. If arduino-cli is missing, tell the user: brew install arduino-cli.
+- After flashing, use serial_open + serial_read to watch the board's live output (it streams to the UI serial monitor too); serial_write to command it.
+- You can also use other ecosystems (ESP-IDF, MicroPython/mpremote, PlatformIO) via run_shell when better suited.
 
 Working style:
 - Act like a great secretary: just DO things, don't ask permission for normal tasks
@@ -515,6 +611,12 @@ async function runAgent(sessionId, userText, onEvent) {
   }
 
   let history = conversations.get(sessionId) || [];
+
+  // Inject pending hardware events so Jarvis can acknowledge them
+  if (pendingHwEvents.length) {
+    userText = `[System note — hardware events since last message: ${pendingHwEvents.join('; ')}]\n\n${userText}`;
+    pendingHwEvents.length = 0;
+  }
 
   // Build user message content — auto-attach screenshot if enabled
   let userContent;
@@ -641,6 +743,7 @@ function createWindow() {
     },
   });
   win.loadURL(RENDERER_URL);
+  win.on('show', () => { try { win.webContents.send('jarvis:shown'); } catch { /* not ready */ } });
   win.on('blur', () => {
     if (!win.webContents.isDevToolsOpened()) win.hide();
   });
@@ -702,6 +805,14 @@ ipcMain.handle('jarvis:reset', (event, { sessionId }) => {
   conversations.delete(sessionId);
   return { ok: true };
 });
+ipcMain.handle('jarvis:list-ports', async () => {
+  try {
+    const ports = await SerialPort.list();
+    return ports.map((p) => ({ path: p.path, manufacturer: p.manufacturer, vendorId: p.vendorId, productId: p.productId }));
+  } catch {
+    return [];
+  }
+});
 ipcMain.handle('jarvis:phone-info', async () => {
   if (!webServerHandle) return null;
   const url = webServerHandle.getUrl(PHONE_TOKEN);
@@ -718,6 +829,7 @@ app.whenReady().then(() => {
   createTray();
   createWindow();
   globalShortcut.register('CommandOrControl+Shift+Space', toggleWindow);
+  startDeviceWatcher();
 
   // Start phone web server
   try {

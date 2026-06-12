@@ -28,9 +28,17 @@ A menu bar AI assistant powered by Claude Sonnet 4.5 that **actually controls yo
 - `rebuild_self` triggers `npm run build` in background
 - `restart_self` quits & relaunches
 
-### 🔌 Hardware control
+### 🔌 Hardware control & 🤖 Robot Mode
 - Arduino, ESP32, robots, microcontrollers (`list_serial_ports`, `serial_command`, `serial_open/write/read/close`)
 - Full USB device introspection (`list_usb_devices`)
+- **Auto-detection**: plug in a board → Jarvis acknowledges it (notification + chat note) but won't touch it until you ask
+- **Auto-flash**: ask "write code for my Arduino and flash it" → Jarvis writes the sketch, compiles & uploads via `arduino-cli` (`detect_boards`, `arduino_flash`, `arduino_cli`)
+- **Live serial monitor**: tap 🤖 in the header to see connected boards + their serial output streaming live
+- One-time setup for flashing: `brew install arduino-cli`
+
+### 🎬 Cinematic intro
+- Full Iron-Man-style helmet animation on first summon (eyes flare, light sweep, particles)
+- Quick mini version on every later summon — click anywhere to skip
 
 ### 🎙️ Voice
 - Talk to it (Web Speech API)

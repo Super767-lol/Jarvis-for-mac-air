@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Orb from './Orb.jsx';
 import HelmetIntro from './HelmetIntro.jsx';
+import IdleMode from './IdleMode.jsx';
 
 const STATUS = { idle: 'Ready', listening: 'Listening…', thinking: 'Thinking…', speaking: 'Speaking…', tool: 'Working…' };
 
@@ -14,6 +15,7 @@ export default function App() {
   const [showPhone, setShowPhone] = useState(false);
   const [phoneInfo, setPhoneInfo] = useState(null);
   const [showRobot, setShowRobot] = useState(false);
+  const [showIdle, setShowIdle] = useState(false);
   const [devices, setDevices] = useState([]);
   const [serialFeed, setSerialFeed] = useState([]);
   const [intro, setIntro] = useState(null);
@@ -140,6 +142,33 @@ export default function App() {
     window.jarvis.send(sessionId, text);
   }, [input, sessionId]);
 
+  // Idle mode: send a search prompt through the Jarvis agent
+  const handleIdleUpdate = useCallback((prompt, onResult) => {
+    pushLog('idle', `⚽ idle scan running…`);
+    setState('tool');
+
+    // Listen for the next 'done' event and capture the last assistant message
+    const unsubRef = { current: null };
+    let captured = '';
+
+    unsubRef.current = window.jarvis.onEvent((ev) => {
+      if (ev.type === 'delta') {
+        captured += ev.content;
+      } else if (ev.type === 'done') {
+        unsubRef.current?.();
+        setState('idle');
+        onResult(captured || 'No results found.');
+        pushLog('idle', `⚽ scan complete`);
+      } else if (ev.type === 'error') {
+        unsubRef.current?.();
+        setState('idle');
+        onResult(`Error: ${ev.message}`);
+      }
+    });
+
+    window.jarvis.send(sessionId, prompt);
+  }, [sessionId]);
+
   const resetConversation = async () => {
     await window.jarvis.reset({ sessionId });
     setMessages([]);
@@ -154,6 +183,13 @@ export default function App() {
     else { try { recognitionRef.current.start(); setState('listening'); pushLog('mic', 'listening…'); } catch {} }
   };
 
+  // Close other panels when opening one
+  const openPanel = (panel) => {
+    setShowRobot(panel === 'robot');
+    setShowPhone(panel === 'phone');
+    setShowIdle(panel === 'idle');
+  };
+
   return (
     <div className="w-screen h-screen flex items-center justify-center p-2">
       <div className="relative w-full h-full bg-[#09090b]/55 backdrop-blur-3xl rounded-[28px] border border-white/[0.08] shadow-[0_0_120px_rgba(0,0,0,0.9)] overflow-hidden flex flex-col">
@@ -164,16 +200,31 @@ export default function App() {
             <span className="text-[10px] uppercase tracking-[0.3em] font-mono text-white/50">JARVIS</span>
           </div>
           <div className="flex items-center gap-1" data-no-drag>
-            <button data-testid="robot-panel-btn" onClick={() => { setShowRobot((v) => !v); setShowPhone(false); }} title="Robot mode"
-              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs hover:bg-white/10 ${showRobot ? 'text-amber-300' : 'text-white/50 hover:text-white'}`}>🤖</button>
-            <button onClick={() => { setShowPhone((v) => !v); setShowRobot(false); }} title="Phone access"
-              className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">📱</button>
+            <button
+              data-testid="robot-panel-btn"
+              onClick={() => openPanel(showRobot ? null : 'robot')}
+              title="Robot mode"
+              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs hover:bg-white/10 ${showRobot ? 'text-amber-300' : 'text-white/50 hover:text-white'}`}
+            >🤖</button>
+            <button
+              onClick={() => openPanel(showPhone ? null : 'phone')}
+              title="Phone access"
+              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs hover:bg-white/10 ${showPhone ? 'text-cyan-300' : 'text-white/50 hover:text-white'}`}
+            >📱</button>
+            {/* Idle mode button — soccer ball */}
+            <button
+              onClick={() => openPanel(showIdle ? null : 'idle')}
+              title="Idle scan: MLS U15 scouts"
+              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs hover:bg-white/10 ${showIdle ? 'text-emerald-300' : 'text-white/50 hover:text-white'}`}
+            >⚽</button>
             <button onClick={resetConversation} title="Reset conversation"
               className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">↻</button>
             <button onClick={() => setShowTranscript((v) => !v)}
               className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">⌨</button>
-            <button onClick={() => setVoiceEnabled((v) => !v)}
-              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs ${voiceEnabled ? 'text-cyan-300' : 'text-white/30'} hover:bg-white/10`}>♪</button>
+            <button
+              onClick={() => setVoiceEnabled((v) => !v)}
+              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs ${voiceEnabled ? 'text-cyan-300' : 'text-white/30'} hover:bg-white/10`}
+            >♪</button>
             <button onClick={() => window.jarvis.hide()}
               className="w-7 h-7 rounded-full flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 text-xs">×</button>
           </div>
@@ -219,20 +270,20 @@ export default function App() {
               <div className="text-[10px] uppercase tracking-[0.3em] font-mono text-white/40 mt-1">serial monitor</div>
               <div className="flex-1 min-h-[80px] bg-black/60 rounded-lg p-2 overflow-y-auto font-mono text-[10px] text-emerald-300/80 whitespace-pre-wrap" data-testid="serial-monitor">
                 {serialFeed.length === 0
-                  ? <span className="text-white/25">waiting for serial data… Jarvis streams board output here when working with your robot</span>
+                  ? <span className="text-white/25">waiting for serial data…</span>
                   : serialFeed.slice(-60).map((l, i) => (
                       <div key={`${l.ts}-${i}`}><span className="text-white/30">{l.port.split('/').pop()}▸</span> {l.data}</div>
                     ))}
               </div>
               <div className="text-[10px] text-white/35 leading-relaxed">
-                Ask Jarvis: "write code for my Arduino and flash it" — it compiles &amp; uploads via arduino-cli.<br />
+                Ask Jarvis: "write code for my Arduino and flash it"<br />
                 One-time setup: <code className="text-amber-300/80">brew install arduino-cli</code>
               </div>
             </motion.div>
           )}
         </AnimatePresence>
 
-        {/* Transcript overlay */}
+        {/* Phone panel */}
         <AnimatePresence>
           {showPhone && (
             <motion.div
@@ -257,12 +308,29 @@ export default function App() {
                     {phoneInfo.url}
                   </div>
                   <div className="text-[10px] text-white/40 text-center px-4 leading-relaxed">
-                    Works on same Wi-Fi. For internet access from anywhere,<br />run <code className="text-amber-300/80">cloudflared tunnel --url http://localhost:47823</code> in terminal.
+                    Works on same Wi-Fi. For internet access from anywhere,<br />
+                    run <code className="text-amber-300/80">cloudflared tunnel --url http://localhost:47823</code> in terminal.
                   </div>
                 </>
               ) : (
                 <div className="text-xs text-white/50">phone server unavailable</div>
               )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* ⚽ Idle Mode panel */}
+        <AnimatePresence>
+          {showIdle && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+              className="absolute inset-x-0 top-12 bottom-28 bg-black/85 backdrop-blur-xl border-t border-white/5 z-30 flex flex-col overflow-hidden"
+              data-no-drag
+            >
+              <IdleMode
+                onUpdate={handleIdleUpdate}
+                onComplete={() => pushLog('idle', '⚽ 15-min session complete')}
+              />
             </motion.div>
           )}
         </AnimatePresence>
@@ -292,10 +360,11 @@ export default function App() {
             {toolLog.slice(-6).map((l, i) => (
               <motion.div key={`${l.ts}-${i}`} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} className="flex gap-2">
                 <span className={
-                  l.t === 'err' ? 'text-red-400/80'
-                  : l.t === 'ok' ? 'text-emerald-400/80'
+                  l.t === 'err'  ? 'text-red-400/80'
+                  : l.t === 'ok'   ? 'text-emerald-400/80'
                   : l.t === 'user' ? 'text-cyan-300/70'
                   : l.t === 'tool' ? 'text-amber-300/80'
+                  : l.t === 'idle' ? 'text-emerald-300/80'
                   : 'text-white/40'
                 }>[{l.t}]</span>
                 <span className="truncate">{l.m}</span>

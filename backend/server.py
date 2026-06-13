@@ -2,6 +2,7 @@
 Jarvis — AI Assistant Backend
 Streams Claude Sonnet 4.5 responses + simulates computer-control tools
 (real tools live in the Electron desktop app).
+NOW WITH OFFLINE MODE SUPPORT
 """
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import StreamingResponse
@@ -18,6 +19,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, ConfigDict
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+from offline_mode import OfflineCache, OfflineFallback, is_online
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -33,6 +35,10 @@ api_router = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Initialize offline mode components
+offline_cache = OfflineCache()
+offline_fallback = OfflineFallback(offline_cache)
 
 SYSTEM_PROMPT = """You are JARVIS — a witty, capable, deeply intelligent AI assistant living on the user's MacBook.
 
@@ -78,18 +84,70 @@ class SessionInfo(BaseModel):
 
 @api_router.get("/")
 async def root():
-    return {"message": "Jarvis online.", "status": "ready"}
+    online = await is_online()
+    return {
+        "message": "Jarvis online.", 
+        "status": "ready",
+        "mode": "online" if online else "offline"
+    }
+
+
+@api_router.get("/status")
+async def get_status():
+    """Check online/offline status"""
+    online = await is_online()
+    return {
+        "online": online,
+        "mode": "online" if online else "offline",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 
 @api_router.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    """Stream Claude response token-by-token via SSE."""
+    """Stream Claude response token-by-token via SSE. Falls back to offline mode if needed."""
     # Persist user message
     user_msg = ChatMessage(session_id=req.session_id, role="user", content=req.message)
     doc = user_msg.model_dump()
     doc['timestamp'] = doc['timestamp'].isoformat()
-    await db.messages.insert_one(doc)
+    
+    try:
+        await db.messages.insert_one(doc)
+    except Exception as e:
+        logger.warning(f"DB write failed (offline?): {e}")
 
+    # Check if we're online
+    online = await is_online()
+    
+    if not online:
+        # Use offline fallback
+        logger.info("Operating in OFFLINE mode")
+        async def offline_generator():
+            fallback_response = await offline_fallback.get_response(req.message)
+            
+            # Stream it character by character for consistent UX
+            for char in fallback_response:
+                payload = json.dumps({"type": "delta", "content": char})
+                yield f"data: {payload}\\n\\n"
+            
+            # Persist assistant message
+            assistant_msg = ChatMessage(session_id=req.session_id, role="assistant", content=fallback_response)
+            doc2 = assistant_msg.model_dump()
+            doc2['timestamp'] = doc2['timestamp'].isoformat()
+            try:
+                await db.messages.insert_one(doc2)
+            except:
+                pass  # DB might be offline too
+            
+            yield f"data: {json.dumps({'type': 'done', 'offline': True})}\\n\\n"
+        
+        return StreamingResponse(
+            offline_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # Online mode - use LLM
     chat = LlmChat(
         api_key=EMERGENT_LLM_KEY,
         session_id=req.session_id,
@@ -103,18 +161,22 @@ async def chat_stream(req: ChatRequest):
                 if isinstance(event, TextDelta):
                     full_text += event.content
                     payload = json.dumps({"type": "delta", "content": event.content})
-                    yield f"data: {payload}\n\n"
+                    yield f"data: {payload}\\n\\n"
                 elif isinstance(event, StreamDone):
                     break
+            
+            # Cache the response for offline use
+            await offline_cache.set(req.message, full_text)
+            
             # Persist assistant message
             assistant_msg = ChatMessage(session_id=req.session_id, role="assistant", content=full_text)
             doc2 = assistant_msg.model_dump()
             doc2['timestamp'] = doc2['timestamp'].isoformat()
             await db.messages.insert_one(doc2)
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'offline': False})}\\n\\n"
         except Exception as e:
             logger.exception("stream error")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\\n\\n"
 
     return StreamingResponse(
         event_generator(),
@@ -125,18 +187,26 @@ async def chat_stream(req: ChatRequest):
 
 @api_router.get("/chat/history/{session_id}", response_model=List[ChatMessage])
 async def get_history(session_id: str):
-    cursor = db.messages.find({"session_id": session_id}, {"_id": 0}).sort("timestamp", 1)
-    msgs = await cursor.to_list(1000)
-    for m in msgs:
-        if isinstance(m.get('timestamp'), str):
-            m['timestamp'] = datetime.fromisoformat(m['timestamp'])
-    return msgs
+    try:
+        cursor = db.messages.find({"session_id": session_id}, {"_id": 0}).sort("timestamp", 1)
+        msgs = await cursor.to_list(1000)
+        for m in msgs:
+            if isinstance(m.get('timestamp'), str):
+                m['timestamp'] = datetime.fromisoformat(m['timestamp'])
+        return msgs
+    except Exception as e:
+        logger.warning(f"History fetch failed (offline?): {e}")
+        return []
 
 
 @api_router.delete("/chat/history/{session_id}")
 async def clear_history(session_id: str):
-    result = await db.messages.delete_many({"session_id": session_id})
-    return {"deleted": result.deleted_count}
+    try:
+        result = await db.messages.delete_many({"session_id": session_id})
+        return {"deleted": result.deleted_count}
+    except Exception as e:
+        logger.warning(f"History clear failed: {e}")
+        return {"deleted": 0}
 
 
 @api_router.post("/session/new")
